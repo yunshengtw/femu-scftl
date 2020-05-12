@@ -763,8 +763,8 @@ typedef struct FEMU_OC12_BbtSet {
   uint64_t rsvd1[2];
   uint64_t prp1;
   uint64_t prp2;
-  uint64_t spba;
-  uint16_t nlb;
+  uint64_t spba; 
+  uint16_t nlb; //
   uint8_t value;
   uint8_t rsvd3;
   uint32_t rsvd4[3];
@@ -1007,13 +1007,13 @@ typedef struct NvmeRequest {
     uint16_t                status;
     uint64_t                slba;
     uint16_t                is_write;
-    uint16_t                nlb;
+    uint16_t                nlb;//
     uint16_t                ctrl;
     uint64_t                meta_size;
     uint64_t                mptr;
     void                    *meta_buf;
-    uint64_t                femu_oc12_slba;
-    uint64_t                *femu_oc12_ppa_list;
+    uint64_t                femu_oc12_slba;//
+    uint64_t                *femu_oc12_ppa_list;//*
     NvmeCqe                 cqe;
     QEMUSGList              qsg;
     QEMUIOVector            iov;

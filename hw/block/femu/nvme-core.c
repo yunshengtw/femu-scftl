@@ -4,6 +4,8 @@
 #include "hw/pci/msi.h"
 
 #include "nvme.h"
+extern int femu_write;
+extern int femu_read;
 
 void nvme_free_sq(NvmeSQueue *sq, FemuCtrl *n)
 {
@@ -822,6 +824,9 @@ static uint16_t nvme_admin_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cqe)
         femu_debug("admin cmd,create_cq\n");
         return nvme_create_cq(n, cmd);
     case NVME_ADM_CMD_IDENTIFY:
+        femu_debug("femu_write: %d\nfemu_read: %d\n", femu_write, femu_read);
+		femu_write = 0;
+		femu_read = 0;
         femu_debug("admin cmd,identify\n");
         return nvme_identify(n, cmd);
     case NVME_ADM_CMD_SET_FEATURES:

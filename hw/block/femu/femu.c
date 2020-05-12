@@ -307,11 +307,32 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     }
 
     ns = &n->namespaces[nsid - 1];
+	// femu_debug("cmd_opcode %d\tnsid %d\t slba %d femu_ppalist[0] %d",
+    //  cmd->opcode, nsid, req->femu_oc12_slba, *(req->femu_oc12_ppa_list));
+    // femu_debug("%x-%x-%x-%x-%x-%x", 
+    // cmd->opcode,
+    // cmd->fuse,
+    // cmd->cid,
+    // cmd->nsid,
+    // cmd->res1,
+    // cmd->mptr);
+    // femu_debug("-%x-%x-%x-%x",
+    // cmd->prp1,
+    // cmd->prp2,
+    // cmd->cdw10, //base
+    // cmd->cdw11);//offset+1
+    // femu_debug("-%x-%8x-%8x-%8x\n",
+    // cmd->cdw12,
+    // cmd->cdw13,
+    // cmd->cdw14,
+    // cmd->cdw15);
+    
 
     switch (cmd->opcode) {
     case NVME_CMD_READ:
     case NVME_CMD_WRITE:
-        return nvme_rw(n, ns, cmd, req);
+        //return nvme_rw(n, ns, cmd, req);
+    	return nvme_scftl(n, ns, cmd, req);
 
     case NVME_CMD_FLUSH:
         if (!n->id_ctrl.vwc || !n->features.volatile_wc) {

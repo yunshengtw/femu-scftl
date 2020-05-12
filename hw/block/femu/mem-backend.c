@@ -13,6 +13,7 @@ void femu_init_mem_backend(struct femu_mbe *mbe, int64_t nbytes)
 
     mbe->size = nbytes;
     mbe->mem_backend = g_malloc0(nbytes);
+	memset(mbe->mem_backend, 0xff, nbytes);
     if (mbe->mem_backend == NULL) {
         error_report("FEMU: cannot allocate %" PRId64 " bytes for emulating SSD,"
                 "make sure you have enough free DRAM in your host\n", nbytes);

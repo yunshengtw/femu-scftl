@@ -4,6 +4,8 @@
 #include "qemu/error-report.h"
 
 #include "../nvme.h"
+int femu_write = 0;
+int femu_read = 0;
 
 int64_t chip_next_avail_time[128]; /* Coperd: when chip will be not busy */
 int64_t chnl_next_avail_time[16]; /* Coperd: when chnl will be free */
@@ -293,6 +295,172 @@ static void *femu_oc12_meta_index(FEMU_OC12_Ctrl *ln, void *meta, uint32_t index
     return meta + (index * ln->params.sos);
 }
 
+uint16_t nvme_scftl(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+    NvmeRequest *req)
+{
+    // ------
+    // ----- 
+    NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
+    uint16_t ctrl = le16_to_cpu(rw->control);
+    uint32_t nlb  = le16_to_cpu(rw->nlb) + 1;
+    uint64_t slba = le64_to_cpu(rw->slba);
+    uint64_t prp1 = le64_to_cpu(rw->prp1);
+    uint64_t prp2 = le64_to_cpu(rw->prp2);
+    const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
+    const uint16_t ms = le16_to_cpu(ns->id_ns.lbaf[lba_index].ms);
+    const uint8_t data_shift = ns->id_ns.lbaf[lba_index].ds;
+    uint64_t data_size = (uint64_t)nlb << data_shift;
+    uint64_t data_offset = slba << data_shift;
+    uint64_t meta_size = nlb * ms;
+    uint64_t elba = slba + nlb;
+    uint16_t err;
+    int ret;
+    FEMU_OC12_Ctrl *ln = &n->femu_oc12_ctrl;
+    FEMU_OC12_IdGroup *c = &ln->id_ctrl.groups[0];
+    uint16_t is_write = (cmd->opcode == NVME_CMD_WRITE);
+    uint8_t i;
+    int64_t now;
+    int64_t max = 0;
+    int ch, lun, pg, lunid;
+    int64_t io_done_ts = 0, start_data_transfer_ts = 0;
+    int64_t need_to_emulate_tt = 0;
+    uint64_t sppa, eppa, ppa;
+	static int cnt_wr = 0;
+    //CALCULATE LATENCY 
+    if (is_write) {
+        /* Coperd: LightNVM only issues 32KB I/O writes */
+        ppa = slba;
+        ch = (ppa & ln->ppaf.ch_mask) >> ln->ppaf.ch_offset;
+        lun = (ppa & ln->ppaf.lun_mask) >> ln->ppaf.lun_offset;
+        pg = (ppa & ln->ppaf.pg_mask) >> ln->ppaf.pg_offset;
+        lunid = ch * c->num_lun + lun;
+        io_done_ts = 0;
+        start_data_transfer_ts = 0;
+		femu_debug("[nvme-scftl] ppa = %lu ch = %d lun = %d @ %d\n", ppa, ch, lun, cnt_wr++);
+
+        assert(ch < c->num_ch && lun < c->num_lun);
+        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+        /* Coperd: for writes, transfer data through channel first and then do
+         * NAND write by moving data from data register to NAND
+         */
+        if (now < chnl_next_avail_time[ch]) {
+            start_data_transfer_ts = chnl_next_avail_time[ch];
+        } else {
+            start_data_transfer_ts = now;
+        }
+        chnl_next_avail_time[ch] = start_data_transfer_ts + chnl_page_tr_t * 2;
+
+        if (chnl_next_avail_time[ch] < chip_next_avail_time[lunid]) {
+            if (is_upper_page(pg)) {
+                chip_next_avail_time[lunid] += nand_write_upper_t;
+            } else {
+                chip_next_avail_time[lunid] += nand_write_lower_t;
+            }
+        } else {
+            if (is_upper_page(pg)) {
+                chip_next_avail_time[lunid] = chnl_next_avail_time[ch] + nand_write_upper_t;
+            } else {
+                chip_next_avail_time[lunid] = chnl_next_avail_time[ch] + nand_write_lower_t;
+            }
+        }
+
+        io_done_ts = chip_next_avail_time[lunid];
+
+        /* Coperd: the time need to emulate is (io_done_ts - now) */
+        need_to_emulate_tt = io_done_ts - now;
+        if (need_to_emulate_tt > max)
+            max = need_to_emulate_tt;
+    } else {
+        /* Coperd: reads, LightNVM only issues SNGL reads */
+        ppa = slba;
+        /* Coperd: these are NAND pages we need to handle */
+        int nb_secs_to_read = 2;
+        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+        ch = (ppa & ln->ppaf.ch_mask) >> ln->ppaf.ch_offset;
+        lun = (ppa & ln->ppaf.lun_mask) >> ln->ppaf.lun_offset;
+        //pl = (ppa & ln->ppaf.pln_mask) >> ln->ppaf.pln_offset;
+        //blk = (ppa & ln->ppaf.blk_mask) >> ln->ppaf.blk_offset;
+        pg = (ppa & ln->ppaf.pg_mask) >> ln->ppaf.pg_offset;
+        //sec = (ppa & ln->ppaf.sec_mask) >> ln->ppaf.sec_offset;
+        lunid = ch * c->num_lun + lun;
+
+		io_done_ts = 0;
+		start_data_transfer_ts = 0;
+		assert(ch < c->num_ch && lun < c->num_lun);
+		if (now < chip_next_avail_time[lunid]) {
+			/* Coperd: need to wait for target chip to be free */
+			if (is_upper_page(pg)) {
+				chip_next_avail_time[lunid] += nand_read_upper_t;
+			} else {
+				chip_next_avail_time[lunid] += nand_read_lower_t;
+			}
+		} else {
+			/* Coperd: target chip is free */
+			if (is_upper_page(pg)) {
+				chip_next_avail_time[lunid] = now + nand_read_upper_t;
+			} else {
+				chip_next_avail_time[lunid] = now + nand_read_lower_t;
+			}
+		}
+		start_data_transfer_ts = chip_next_avail_time[lunid];
+		/* Coperd: TODO: replace 4 with a calculated value (c->num_sec) */
+		assert(nb_secs_to_read <= 8 && nb_secs_to_read >= 1);
+		int chnl_transfer_time = chnl_page_tr_t * nb_secs_to_read / 4;
+
+		if (start_data_transfer_ts < chnl_next_avail_time[ch]) {
+			/* Coperd: need to wait for channel to be free */
+			chnl_next_avail_time[ch] += chnl_transfer_time;
+		} else {
+			/* Coperd: use the chnl immediately after reading from NAND */
+			chnl_next_avail_time[ch] = start_data_transfer_ts + chnl_transfer_time;
+		}
+
+		chip_next_avail_time[lunid] = chnl_next_avail_time[ch];
+		io_done_ts = chnl_next_avail_time[ch];
+
+		/* Coperd: the time need to emulate is (io_done_ts - now) */
+		need_to_emulate_tt = io_done_ts - now;
+		if (need_to_emulate_tt > max)
+			max = need_to_emulate_tt;
+    }
+    femu_debug("max: %lu\n", max);
+    req->expire_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + max;
+    // ------
+    
+
+    req->data_offset = data_offset;
+    req->is_write = (rw->opcode == NVME_CMD_WRITE) ? 1 : 0;
+
+    err = femu_nvme_rw_check_req(n, ns, cmd, req, slba, elba, nlb, ctrl, data_size,
+            meta_size);
+    if (err)
+        return err;
+
+    if (nvme_map_prp(&req->qsg, &req->iov, prp1, prp2, data_size, n)) {
+        nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_INVALID_FIELD,
+                offsetof(NvmeRwCmd, prp1), 0, ns->id);
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    assert((nlb << data_shift) == req->qsg.size);
+
+    req->slba = slba;
+    req->meta_size = 0;
+    req->status = NVME_SUCCESS;
+    req->nlb = nlb;
+    req->ns = ns;
+
+    ret = femu_rw_mem_backend_bb(&n->mbe, &req->qsg, data_offset, req->is_write);
+    if (!ret) {
+        return NVME_SUCCESS;
+    }
+
+    return NVME_DNR;
+    
+}
+
 uint16_t femu_oc12_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     NvmeRequest *req)
 {
@@ -346,9 +514,12 @@ uint16_t femu_oc12_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         err = NVME_INVALID_FIELD | NVME_DNR;
         goto fail_free_msl;
     } else if (n_pages > 1) {
+        // TODO: modify
         femu_nvme_addr_read(n, spba, (void *)psl, n_pages * sizeof(void *));
+		//femu_debug("n_pages > 1; psl[0] = %lu psl[1] = %lu", psl[0], psl[1]);
     } else {
         psl[0] = spba;
+		//femu_debug("n_pages = 1; psl[0] = %lu", psl[0]);
     }
 
     if (spba == FEMU_OC12_PBA_UNMAPPED) {
@@ -393,6 +564,7 @@ uint16_t femu_oc12_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     int64_t io_done_ts = 0, start_data_transfer_ts = 0;
     int64_t need_to_emulate_tt = 0;
     //printf("Coperd,opcode=%d,n_pages=%d\n", req->cmd_opcode, n_pages);
+	static int cnt_wr = 0;
 
     if (is_write) {
         /* Coperd: LightNVM only issues 32KB I/O writes */
@@ -403,6 +575,7 @@ uint16_t femu_oc12_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         lunid = ch * c->num_lun + lun;
         io_done_ts = 0;
         start_data_transfer_ts = 0;
+		femu_debug("[oc12_rw] ppa = %lu ch = %d lun = %d @ %d\n", ppa, ch, lun, cnt_wr++);
 
         assert(ch < c->num_ch && lun < c->num_lun);
         now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -437,6 +610,7 @@ uint16_t femu_oc12_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         need_to_emulate_tt = io_done_ts - now;
         if (need_to_emulate_tt > max)
             max = need_to_emulate_tt;
+		femu_debug("[oc12_rw] max: %lu\n", max);
     } else {
         /* Coperd: reads, LightNVM only issues SNGL reads */
         memset(secs_layout, 0, sizeof(int) * 64);
@@ -510,6 +684,7 @@ uint16_t femu_oc12_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             need_to_emulate_tt = io_done_ts - now;
             if (need_to_emulate_tt > max)
                 max = need_to_emulate_tt;
+			femu_debug("[oc12_rw] max: %lu\n", max);
         }
     }
 
@@ -530,6 +705,7 @@ uint16_t femu_oc12_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         aio_sector_list[i] = ns->start_block + (ppa << data_shift);
 
         if (is_write) {
+			femu_write++;
 #if 1
             if (femu_oc12_meta_state_set_written(ln, ppa)) {
                 femu_err("femu_oc12_rw: set written status failed\n");
@@ -548,6 +724,7 @@ uint16_t femu_oc12_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                 }
             }
         } else if (!is_write){
+			femu_read++;
             uint32_t state;
 
             if (femu_oc12_meta_state_get(ln, ppa, &state)) {
@@ -770,11 +947,13 @@ int femu_oc12_flush_tbls(FemuCtrl *n)
 uint16_t femu_oc12_erase_async(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     NvmeRequest *req)
 {
+	
     FEMU_OC12_Ctrl *ln = &n->femu_oc12_ctrl;
     FEMU_OC12_RwCmd *dm = (FEMU_OC12_RwCmd *)cmd;
     uint64_t spba = le64_to_cpu(dm->spba);
     uint64_t psl[ln->params.max_sec_per_rq];
     uint32_t nlb = le16_to_cpu(dm->nlb) + 1;
+//    femu_debug("[DEBUG] femu_oc12_erase_async!!! nlb %d\n", nlb);
     //int pmode = le16_to_cpu(dm->control) & (FEMU_OC12_PMODE_DUAL | FEMU_OC12_PMODE_QUAD);
 
     if (nlb > 1) {
