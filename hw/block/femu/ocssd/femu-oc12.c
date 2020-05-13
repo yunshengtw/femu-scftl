@@ -326,6 +326,7 @@ uint16_t nvme_scftl(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     int64_t need_to_emulate_tt = 0;
     uint64_t sppa, eppa, ppa;
 	static int cnt_wr = 0;
+
     //CALCULATE LATENCY 
     if (is_write) {
         /* Coperd: LightNVM only issues 32KB I/O writes */
@@ -336,7 +337,7 @@ uint16_t nvme_scftl(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         lunid = ch * c->num_lun + lun;
         io_done_ts = 0;
         start_data_transfer_ts = 0;
-		femu_debug("[nvme-scftl] ppa = %lu ch = %d lun = %d @ %d\n", ppa, ch, lun, cnt_wr++);
+		femu_debug("[nvme-scftl] w @ psa = %lu ch = %d lun = %d # %d\n", ppa, ch, lun, cnt_wr++);
 
         assert(ch < c->num_ch && lun < c->num_lun);
         now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -385,6 +386,7 @@ uint16_t nvme_scftl(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         pg = (ppa & ln->ppaf.pg_mask) >> ln->ppaf.pg_offset;
         //sec = (ppa & ln->ppaf.sec_mask) >> ln->ppaf.sec_offset;
         lunid = ch * c->num_lun + lun;
+		femu_debug("[nvme-scftl] r @ psa = %lu ch = %d lun = %d\n", ppa, ch, lun);
 
 		io_done_ts = 0;
 		start_data_transfer_ts = 0;
@@ -979,20 +981,33 @@ uint16_t femu_oc12_erase_async(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     }
 #endif
 
-    int ch = (psl[0] & ln->ppaf.ch_mask) >> ln->ppaf.ch_offset;
-    int lun = (psl[0] & ln->ppaf.lun_mask) >> ln->ppaf.lun_offset;
-    //int num_ch = ln->id_ctrl.groups[0].num_ch;
-    int num_lun = ln->id_ctrl.groups[0].num_lun;
-    int lunid = ch * num_lun + lun;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+	femu_debug("erase psl = \n");
+	for (int i = 0; i < 10; i++)
+		femu_debug("%lu\n", psl[i]);
+	femu_debug("nlb = %u\n", nlb);
+	femu_debug("spba = %lu\n", spba);
+    int64_t max = 0;
 
-    if (now < chip_next_avail_time[lunid]) {
-        chip_next_avail_time[lunid] += nand_erase_t;
-    } else {
-        chip_next_avail_time[lunid] = now + nand_erase_t;
-    }
+	for (uint64_t i = 0; i < nlb; i++) {
+		int ch = (psl[i] & ln->ppaf.ch_mask) >> ln->ppaf.ch_offset;
+		int lun = (psl[i] & ln->ppaf.lun_mask) >> ln->ppaf.lun_offset;
+		//int num_ch = ln->id_ctrl.groups[0].num_ch;
+		int num_lun = ln->id_ctrl.groups[0].num_lun;
+		int lunid = ch * num_lun + lun;
+		int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
-    req->expire_time = chip_next_avail_time[lunid];
+		femu_debug("[nvme-scftl] e @ psa = %lu ch = %d lun = %d\n", psl[i], ch, lun);
+		if (now < chip_next_avail_time[lunid]) {
+			chip_next_avail_time[lunid] += nand_erase_t;
+		} else {
+			chip_next_avail_time[lunid] = now + nand_erase_t;
+		}
+
+		if (chip_next_avail_time[lunid] > max)
+			max = chip_next_avail_time[lunid];
+	}
+
+    req->expire_time = max;
 
     req->status = NVME_SUCCESS;
 
